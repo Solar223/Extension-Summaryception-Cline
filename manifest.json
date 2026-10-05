@@ -1,0 +1,12 @@
+{
+    "display_name": "Summaryception (Cline)",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Lodactio (Cline fix fork)",
+    "version": "5.5.4-cline.1",
+    "homePage": "https://github.com/Lodactio/Extension-Summaryception",
+    "auto_update": true
+}
