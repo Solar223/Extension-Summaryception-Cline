@@ -2756,8 +2756,20 @@ async function fetchProfilesFallback(selectElement, currentValue) {
 
     getSettings();
 
+    // Resolve this extension's own folder name dynamically (TauriTavern/ST install
+    // folders are named after the repo, e.g. 'Extension-Summaryception-Cline').
+    // import.meta.url = .../scripts/extensions/third-party/<folder>/index.js
+    let selfFolder = 'Extension-Summaryception';
+    try {
+        const here = new URL(import.meta.url).pathname;
+        const parts = here.split('/').filter(Boolean);
+        const tp = parts.indexOf('third-party');
+        if (tp !== -1 && parts[tp + 1]) selfFolder = parts[tp + 1];
+    } catch (e) { /* fallback to legacy name */ }
+    console.debug('[Summaryception] extension folder resolved as:', selfFolder);
+
     const html = await renderExtensionTemplateAsync(
-        'third-party/Extension-Summaryception',
+        'third-party/' + selfFolder,
         'settings',
         {}
     );
