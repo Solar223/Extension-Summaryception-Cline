@@ -24,7 +24,9 @@ const MODULE_NAME = '[Summaryception][Connection]';
 const LLM_DEFAULTS = Object.freeze({
     ollamaTemperature:    0.3,    // Lower = more deterministic summaries
     openaiTemperature:    0.8,    // Slightly creative for narrative flow
-    testMaxTokens:        100,    // Small ceiling for the "Test Connection" probe
+    testMaxTokens:        4096,   // Generous ceiling for the "Test Connection" probe
+                                     // (GLM-family reasoning tokens count against max_tokens on
+                                     //  Cline Pass; a small cap yields EMPTY content = false failure)
     testPreviewLength:    100,    // Characters of response shown in test result toast
 });
 
@@ -492,121 +494,143 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
 
     const body = JSON.stringify(requestBody);
 
-    let response;
-    if (needsProxy) {
-        try {
-            response = await fetch(proxiedUrl(endpoint), {
-                method: 'POST',
-                headers: { ...getProxyHeaders(), ...headers },
-                                   body: body,
-            });
-        } catch (proxyError) {
-            console.warn(`${MODULE_NAME} CORS proxy failed for OpenAI endpoint, trying direct:`, proxyError.message);
+    // Inner fetch+SSE assembly, factored so we can retry without max_tokens when
+    // reasoning eats the whole budget (GLM-family on Cline Pass).
+    async function fetchAndAssemble(useTokenLimit) {
+        const rb = { ...requestBody };
+        if (!useTokenLimit) delete rb.max_tokens;
+        const b = JSON.stringify(rb);
+        const reqInit = (extraHeaders) => ({
+            method: 'POST',
+            headers: { ...extraHeaders, ...headers },   // headers includes Authorization
+            body: b,
+        });
+
+        let resp;
+        if (needsProxy) {
             try {
-                response = await fetch(endpoint, {
-                    method: 'POST',
-                    headers: headers,
-                    body: body,
-                });
+                resp = await fetch(proxiedUrl(endpoint), reqInit(getProxyHeaders()));
+            } catch (proxyError) {
+                console.warn(`${MODULE_NAME} CORS proxy failed for OpenAI endpoint, trying direct:`, proxyError.message);
+                try {
+                    resp = await fetch(endpoint, reqInit({}));
+                } catch (directError) {
+                    throw new ConnectionError(
+                        `Failed to connect to ${baseUrl}. ` +
+                        `Enable the CORS proxy in config.yaml (enableCorsProxy: true). ` +
+                        `Proxy error: ${proxyError.message}. Direct error: ${directError.message}`,
+                        { retryable: true }
+                    );
+                }
+            }
+        } else {
+            try {
+                resp = await fetch(endpoint, reqInit({}));
             } catch (directError) {
                 throw new ConnectionError(
-                    `Failed to connect to ${baseUrl}. ` +
-                    `Enable the CORS proxy in config.yaml (enableCorsProxy: true). ` +
-                    `Proxy error: ${proxyError.message}. Direct error: ${directError.message}`,
+                    `Failed to connect to ${baseUrl}: ${directError.message}`,
                     { retryable: true }
                 );
             }
         }
-    } else {
-        try {
-            response = await fetch(endpoint, {
-                method: 'POST',
-                headers: headers,
-                body: body,
-            });
-        } catch (directError) {
+
+        if (!resp.ok) {
+            const errorText = await resp.text().catch(() => 'Unknown error');
+            if (resp.status === 401) {
+                throw new ConnectionError(
+                    'OpenAI Compatible endpoint returned 401 Unauthorized. Check your API key.',
+                    { retryable: false, status: 401 }
+                );
+            }
+            if (resp.status === 403) {
+                throw new ConnectionError(
+                    `OpenAI Compatible endpoint returned 403 Forbidden: ${errorText}`,
+                    { retryable: false, status: 403 }
+                );
+            }
             throw new ConnectionError(
-                `Failed to connect to ${baseUrl}: ${directError.message}`,
+                `OpenAI Compatible request failed (${resp.status}): ${errorText}`,
+                { retryable: resp.status >= 500 || resp.status === 429, status: resp.status }
+            );
+        }
+
+        // ─── Stream reading ──────────────────────────────────────────
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let fullContent = '';
+        let buffer = '';
+        let reasoningChars = 0;
+        let sawFinishLength = false;
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed || !trimmed.startsWith('data:')) continue;
+
+                    const data = trimmed.slice(5).trim();
+                    if (data === '[DONE]') continue;
+
+                    try {
+                        const parsed = JSON.parse(data);
+                        const choice = parsed.choices?.[0];
+                        const delta = choice?.delta;
+                        if (delta?.reasoning || delta?.reasoning_content) {
+                            reasoningChars += (delta.reasoning || delta.reasoning_content || '').length;
+                            continue;
+                        }
+                        if (choice?.finish_reason === 'length') sawFinishLength = true;
+                        if (delta?.content) fullContent += delta.content;
+                    } catch (e) { /* skip unparseable chunks */ }
+                }
+            }
+        } finally {
+            reader.releaseLock();
+        }
+
+        if (!fullContent.trim()) {
+            if (sawFinishLength && reasoningChars > 0) {
+                const err = new ConnectionError(
+                    `Empty response: the model spent its entire max_tokens budget on ` +
+                    `reasoning (${reasoningChars} chars of thinking, zero content).`,
+                    { retryable: true }
+                );
+                err.reasoningOnly = true;
+                throw err;
+            }
+            throw new ConnectionError(
+                'OpenAI Compatible endpoint returned an empty response (streaming).',
                 { retryable: true }
             );
         }
+        return fullContent;
     }
 
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => 'Unknown error');
-        if (response.status === 401) {
-            throw new ConnectionError(
-                'OpenAI Compatible endpoint returned 401 Unauthorized. Check your API key.',
-                { retryable: false, status: 401 }
-            );
-        }
-        if (response.status === 403) {
-            throw new ConnectionError(
-                `OpenAI Compatible endpoint returned 403 Forbidden: ${errorText}`,
-                { retryable: false, status: 403 }
-            );
-        }
-        throw new ConnectionError(
-            `OpenAI Compatible request failed (${response.status}): ${errorText}`,
-                                  { retryable: response.status >= 500 || response.status === 429, status: response.status }
-        );
-    }
-
-    // ─── Stream reading ──────────────────────────────────────────
-    // Read SSE chunks and assemble the full response content.
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullContent = '';
-    let buffer = '';
-
+    let fullContent;
     try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-
-            // Process complete SSE lines
-            const lines = buffer.split('\n');
-            // Keep the last potentially incomplete line in the buffer
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed || !trimmed.startsWith('data:')) continue;
-
-                const data = trimmed.slice(5).trim();
-                if (data === '[DONE]') continue;
-
-                try {
-                    const parsed = JSON.parse(data);
-                    const delta = parsed.choices?.[0]?.delta;
-                    if (delta?.reasoning || delta?.reasoning_content) {
-                        // GLM (Cline Pass) emits its thinking as 'reasoning' deltas;
-                        // never count that as summary output.
-                        continue;
-                    }
-                    if (delta?.content) {
-                        fullContent += delta.content;
-                    }
-                } catch (e) {
-                    // Skip unparseable chunks (comments, keep-alive, etc.)
-                }
-            }
+        fullContent = await fetchAndAssemble(true);
+    } catch (err) {
+        if (err?.reasoningOnly) {
+            // Auto-recover: retry once with no token ceiling so the model can
+            // finish thinking AND answer.
+            console.warn(`${MODULE_NAME} reasoning consumed max_tokens budget; retrying without max_tokens`);
+            fullContent = await fetchAndAssemble(false);
+        } else {
+            throw err;
         }
-    } finally {
-        reader.releaseLock();
-    }
-
-    if (!fullContent.trim()) {
-        throw new ConnectionError(
-            'OpenAI Compatible endpoint returned an empty response (streaming).',
-                                  { retryable: true }
-        );
     }
 
     return fullContent;
 }
+
 
 /**
  * Test the connection to an OpenAI-compatible endpoint.
