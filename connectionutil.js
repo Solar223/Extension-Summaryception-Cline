@@ -467,23 +467,13 @@ function ttRequestHeaders() {
     } catch (e) { /* fall through */ }
     return { 'Content-Type': 'application/json' };
 }
-
-async function ensureTauriSecret(apiKey) {
-    if (!apiKey) return; // user may have already set TT's own custom key
-    try {
-        await fetch('/api/secrets/write', {
-            method: 'POST',
-            headers: ttRequestHeaders(),
-            body: JSON.stringify({ key: TAURI_SECRET_KEY_CUSTOM, value: apiKey }),
-        });
-    } catch (e) {
-        console.warn(`${MODULE_NAME} could not write custom secret to TauriTavern:`, e.message);
-    }
-}
+// NOTE: we deliberately do NOT write to TT's secret store. 'api_key_custom' is shared with the
+// user's MAIN custom connection — overwriting it breaks their chat auth (this exact bug shipped
+// in cline.3). Instead the API key rides on the payload as custom_include_headers, which TT
+// applies as a final override on the upstream request.
 
 // Real implementation (payload built from explicit args to avoid argument sniffing):
 async function ttGenerate({ endpoint, model, systemPrompt, userPrompt, maxTokens, apiKey, temperature }) {
-    await ensureTauriSecret(apiKey);
     const payload = {
         type: 'quiet',
         messages: [
@@ -498,6 +488,11 @@ async function ttGenerate({ endpoint, model, systemPrompt, userPrompt, maxTokens
         custom_api_format: 'openai_compat',
     };
     if (maxTokens && maxTokens > 0) payload.max_tokens = maxTokens;
+    if (apiKey) {
+        // Final-override auth header: TT sends THIS key upstream without touching the
+        // shared 'api_key_custom' secret the user's main connection depends on.
+        payload.custom_include_headers = `Authorization: Bearer ${apiKey}`;
+    }
 
     const resp = await fetch(TT_GENERATE_URL, {
         method: 'POST',
