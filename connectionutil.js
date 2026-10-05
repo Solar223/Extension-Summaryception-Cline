@@ -422,6 +422,171 @@ export async function fetchOllamaModels(url) {
     return data.models;
 }
 
+// ─── Transport resolution (Cline Pass / CORS-less endpoints) ─────────
+//
+// Three runtime environments, three different network realities:
+//   - Desktop SillyTavern: /proxy/<url> works when enableCorsProxy: true. SPA fallback
+//     would return HTML, so we validate by expecting JSON.
+//   - TauriTavern (phone/desktop): NO /proxy/ route exists; unmatched same-origin paths
+//     return the SPA HTML with HTTP 200, which parses as zero SSE events -> "empty response".
+//   - Any webview that enforces CORS: direct fetch to api.cline.bot throws (no ACAO).
+// We probe once and cache the winning transport for the session.
+
+let _transportCache = null; // 'tauri' | 'proxy' | 'direct' | 'none'
+
+const TAURI_SECRET_KEY_CUSTOM = 'api_key_custom';   // TT SECRET_KEYS.CUSTOM
+const TT_GENERATE_URL = '/api/backends/chat-completions/generate';
+
+function isTauriRuntime() {
+    try {
+        return typeof window !== 'undefined'
+            && (window.__TAURI_INTERNALS__ !== undefined
+                || window.__TAURI__ !== undefined
+                || /tauri/i.test(navigator.userAgent || ''));
+    } catch (e) {
+        return false;
+    }
+}
+
+function looksLikeModelList(text) {
+    try {
+        const parsed = JSON.parse(text);
+        return parsed && (parsed.object === 'list' || Array.isArray(parsed.data));
+    } catch (e) {
+        return false;
+    }
+}
+
+// ── TauriTavern same-origin helpers ──
+function ttRequestHeaders() {
+    try {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.getRequestHeaders === 'function') {
+            return ctx.getRequestHeaders();
+        }
+    } catch (e) { /* fall through */ }
+    return { 'Content-Type': 'application/json' };
+}
+
+async function ensureTauriSecret(apiKey) {
+    if (!apiKey) return; // user may have already set TT's own custom key
+    try {
+        await fetch('/api/secrets/write', {
+            method: 'POST',
+            headers: ttRequestHeaders(),
+            body: JSON.stringify({ key: TAURI_SECRET_KEY_CUSTOM, value: apiKey }),
+        });
+    } catch (e) {
+        console.warn(`${MODULE_NAME} could not write custom secret to TauriTavern:`, e.message);
+    }
+}
+
+// Real implementation (payload built from explicit args to avoid argument sniffing):
+async function ttGenerate({ endpoint, model, systemPrompt, userPrompt, maxTokens, apiKey, temperature }) {
+    await ensureTauriSecret(apiKey);
+    const payload = {
+        type: 'quiet',
+        messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+        ],
+        model: model,
+        temperature: temperature,
+        stream: false,
+        chat_completion_source: 'custom',
+        custom_url: endpoint,
+        custom_api_format: 'openai_compat',
+    };
+    if (maxTokens && maxTokens > 0) payload.max_tokens = maxTokens;
+
+    const resp = await fetch(TT_GENERATE_URL, {
+        method: 'POST',
+        headers: ttRequestHeaders(),
+        body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+        const errorText = await resp.text().catch(() => 'Unknown error');
+        throw new ConnectionError(
+            `TauriTavern backend request failed (${resp.status}): ${errorText.slice(0, 300)}`,
+            { retryable: resp.status >= 500 || resp.status === 429, status: resp.status }
+        );
+    }
+    const data = await resp.json().catch(() => null);
+    // Cline wraps completions in {"data": {...}}; OpenAI-compatible endpoints don't.
+    const inner = data?.data?.choices ? data.data : data;
+    const content = inner?.choices?.[0]?.message?.content
+        ?? data?.message?.content
+        ?? (typeof data?.data === 'string' ? data.data : '');
+    if (!content || !String(content).trim()) {
+        throw new ConnectionError(
+            'TauriTavern backend returned an empty response.',
+            { retryable: true }
+        );
+    }
+    return String(content);
+}
+
+async function probeTauriTransport() {
+    if (!isTauriRuntime()) return false;
+    // The generate endpoint is same-origin and handled by TT's fetch interceptor/router.
+    // Probe with a HEAD-like cheap call: TT returns 404 JSON for unknown routes; the
+    // chat-completions status route exists in both TT and desktop ST, so instead we just
+    // accept the runtime detection + same-origin route as valid.
+    return true;
+}
+
+// ── Desktop ST /proxy transport probes ──
+function toBaseUrl(endpoint) {
+    // sendViaOpenAI normalizes to .../chat/completions before calling us; probes want the base.
+    return endpoint.replace(/\/chat\/completions\/?$/, '').replace(/\/+$/, '');
+}
+
+async function probeProxyTransport(endpoint) {
+    try {
+        const probeUrl = proxiedUrl(toBaseUrl(endpoint) + '/models');
+        const resp = await fetch(probeUrl, { method: 'GET', headers: getProxyHeaders() });
+        if (!resp.ok) return false;
+        const text = await resp.text();
+        return looksLikeModelList(text);
+    } catch (e) {
+        return false;
+    }
+}
+
+async function probeDirectTransport(endpoint) {
+    try {
+        const resp = await fetch(toBaseUrl(endpoint) + '/models', { method: 'GET' });
+        if (!resp.ok) return false;
+        const text = await resp.text();
+        return looksLikeModelList(text);
+    } catch (e) {
+        // CORS TypeError lands here
+        return false;
+    }
+}
+
+async function resolveTransport(endpoint) {
+    if (_transportCache) return _transportCache;
+    if (await probeTauriTransport()) {
+        _transportCache = 'tauri';
+        console.info(`${MODULE_NAME} transport: TauriTavern backend (Rust core)`);
+        return 'tauri';
+    }
+    if (await probeProxyTransport(endpoint)) {
+        _transportCache = 'proxy';
+        console.info(`${MODULE_NAME} transport: ST CORS proxy (/proxy/)`);
+        return 'proxy';
+    }
+    if (await probeDirectTransport(endpoint)) {
+        _transportCache = 'direct';
+        console.info(`${MODULE_NAME} transport: direct fetch`);
+        return 'direct';
+    }
+    _transportCache = 'none';
+    console.warn(`${MODULE_NAME} transport: no working route found`);
+    return 'none';
+}
+
 // ─── Mode 4: OpenAI Compatible (Streaming) ──────────────────────────
 
 /**
@@ -494,6 +659,33 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
 
     const body = JSON.stringify(requestBody);
 
+    // Resolve the working transport for this environment once per session.
+    const transport = await resolveTransport(endpoint);
+    if (transport === 'tauri') {
+        // TauriTavern: run through the app's own Rust pipeline. No CORS, no proxy.
+        // TT's Rust core appends /chat/completions itself, so pass the BASE url.
+        const tauriBase = endpoint.replace(/\/chat\/completions\/?$/, '');
+        return await ttGenerate({
+            endpoint: tauriBase,
+            model: model,
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt,
+            maxTokens: maxTokens,
+            apiKey: apiKey,
+            temperature: LLM_DEFAULTS.openaiTemperature,
+        });
+    }
+    if (transport === 'none') {
+        throw new ConnectionError(
+            `Cannot reach ${baseUrl} from this app. ` +
+            `The endpoint sends no Access-Control-Allow-Origin headers, so direct browser ` +
+            `fetches are blocked, and no CORS proxy route is available. ` +
+            `Use desktop SillyTavern with enableCorsProxy: true in config.yaml.`,
+            { retryable: false }
+        );
+    }
+    const useProxyPath = transport === 'proxy';
+
     // Inner fetch+SSE assembly, factored so we can retry without max_tokens when
     // reasoning eats the whole budget (GLM-family on Cline Pass).
     async function fetchAndAssemble(useTokenLimit) {
@@ -507,28 +699,31 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
         });
 
         let resp;
-        if (needsProxy) {
+        if (useProxyPath) {
             try {
                 resp = await fetch(proxiedUrl(endpoint), reqInit(getProxyHeaders()));
             } catch (proxyError) {
-                console.warn(`${MODULE_NAME} CORS proxy failed for OpenAI endpoint, trying direct:`, proxyError.message);
-                try {
-                    resp = await fetch(endpoint, reqInit({}));
-                } catch (directError) {
+                // Transport may have gone stale — invalidate and fail over once.
+                console.warn(`${MODULE_NAME} CORS proxy failed mid-session:`, proxyError.message);
+                _transportCache = null;
+                const alt = await resolveTransport(endpoint);
+                if (alt === 'none') {
                     throw new ConnectionError(
                         `Failed to connect to ${baseUrl}. ` +
                         `Enable the CORS proxy in config.yaml (enableCorsProxy: true). ` +
-                        `Proxy error: ${proxyError.message}. Direct error: ${directError.message}`,
+                        `Proxy error: ${proxyError.message}`,
                         { retryable: true }
                     );
                 }
+                resp = await fetch(endpoint, reqInit({}));
             }
         } else {
             try {
                 resp = await fetch(endpoint, reqInit({}));
             } catch (directError) {
                 throw new ConnectionError(
-                    `Failed to connect to ${baseUrl}: ${directError.message}`,
+                    `Failed to connect to ${baseUrl}: ${directError.message} ` +
+                    `(this environment enforces CORS and the endpoint sends no ACAO headers)`,
                     { retryable: true }
                 );
             }
